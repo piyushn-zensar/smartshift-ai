@@ -1,10 +1,10 @@
 # CONFIG Intent — Sample Test Prompts
 
 > Copy-paste prompts for exercising the CONFIG intent end-to-end via the chat UI
-> (or `POST /api/v1/chat`). Covers **all 15 config types** plus edge cases.
+> (or `POST /api/v1/chat`). Covers **all 19 config types** plus edge cases.
 > Companion to [`CONFIG_INTENT_PROGRESS.md`](CONFIG_INTENT_PROGRESS.md).
 >
-> Last updated: **2026-06-12** · Platform: Cisco IOS · Delivery: Manual (v1)
+> Last updated: **2026-06-15** · Platform: Cisco IOS · Delivery: Manual (v1)
 
 ---
 
@@ -52,9 +52,16 @@ the target/approval tail. (Group shown = which dummy devices the picker lists.)
 | 13 | ntp | `Configure NTP server 10.0.0.200` | standard tail |
 | 14 | snmp | `Configure SNMP community public for host 10.0.0.50 read-only` | standard tail |
 | 15 | syslog | `Send syslog to 10.0.0.60 at informational level` | standard tail |
+| 16 | aaa ⚠️ | `Configure AAA using TACACS+ server 10.0.0.30 with key Secret123` | tail — note **HIGH-risk**; key never displayed |
+| 17 | hsrp | `Configure HSRP group 1 on Vlan10 with virtual IP 10.1.1.1 priority 110` | tail (group: routers) |
+| 18 | vrrp ⚠️ | `Configure VRRP group 5 on Vlan20 with virtual IP 10.2.2.1` | tail (routers) — note **HIGH-risk** warning |
+| 19 | vrf | `Create VRF CUSTOMER_A with route distinguisher 100:1` | tail (routers) |
 
-> ⚠️ For **#2 ssh_access**, the approval summary shows `risk: HIGH` + a `--check` warning, and the
-> delivered command ends with `# high-risk: run with --check first`.
+> ⚠️ **HIGH-risk types** — **#2 ssh_access**, **#16 aaa**, **#18 vrrp** — render `risk: HIGH` + a
+> `--check` warning in the approval summary, and the delivered command ends with
+> `# high-risk: run with --check first`.
+> For **#16 aaa**, the `shared_key` (like any secret) is **never shown** in the summary or the
+> delivered command/inventory.
 
 ---
 
@@ -74,6 +81,10 @@ Provide the rest, then run the standard tail.
 | acl | `Create an ACL named WEB_FILTER` | action + source + destination | `permit tcp from any to 10.0.0.5` |
 | snmp | `Set up SNMP community public` | host | `host 10.0.0.50` |
 | port_channel | `Create Port-channel 20` | member interfaces + mode | `members Gi0/3 and Gi0/4, mode on` |
+| aaa | `Set up AAA with a RADIUS server` | server IP + shared key | `server 10.0.0.30, key Secret123` |
+| hsrp | `Configure HSRP on Vlan10` | group ID + virtual IP | `group 1, virtual IP 10.1.1.1` |
+| vrrp | `Configure VRRP group 1 on Vlan20` | virtual IP | `virtual IP 10.2.2.1` |
+| vrf | `Create a VRF named CUSTOMER_A` | route distinguisher | `route distinguisher 100:1` |
 
 ---
 
