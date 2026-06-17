@@ -261,3 +261,49 @@ approve                                     # delivery (password hidden)
 I need to configure a server on the device  # disambiguation
 2                                           # pick candidate
 ```
+
+---
+
+## G. Form mode (dynamic LLM-built forms)
+
+> Requires `CONFIG_USE_FORMS=true` (default). On the **first** turn the assistant builds a
+> form card (one LLM call) that extracts anything you already said and renders inputs for the
+> rest. **Form submissions are structured — no LLM, no NL parsing per turn.** Collection ends
+> with the **standard tail** (`1` → `1` → `approve`); target/approval are still text this round.
+>
+> Tip: prompts that name **no values** produce the biggest forms (all mandatory fields shown).
+
+### Examples with MANY mandatory fields (bare prompts → full forms)
+
+| Type | Prompt | Form shows (★ = required) |
+|------|--------|---------------------------|
+| ospf | `Set up OSPF` | ★Process ID (number), ★Network, ★Wildcard Mask, ★Area ID, Router ID, State (select) |
+| acl | `Create an access list` | ★ACL Name, ★Action, ★Source, ★Destination, Protocol, Port, State (select) |
+| port_channel | `Configure a port-channel` | ★Channel Group ID (number), ★Member Interfaces, ★Mode, State (select) |
+| interface_l3 | `Configure an interface IP` | ★Interface Name, ★IP Address, ★Subnet Mask (number), Description, Admin State |
+| static_route | `Add a static route` | ★Destination Network, ★Subnet Mask (number), ★Next-hop IP, Admin Distance, State |
+| hsrp | `Set up HSRP` | ★Interface Name, ★Group ID (number), ★Virtual IP, Priority, Preempt, State |
+| aaa ⚠️ | `Configure AAA` | ★Server IP, ★Shared Key (**masked**), ★Auth Type, Server Name, State |
+| user_account | `Create a local user` | ★Username, ★Password (**masked**), Privilege, State |
+
+### Form behaviours to verify
+
+| # | Steps | Expect |
+|---|-------|--------|
+| G1 | `Create a VLAN` | Form: ★VLAN ID (number), ★VLAN Name (text), State (select). Each field has heading + short description + example placeholder. |
+| G2 | In G1, leave VLAN Name blank | **Continue stays greyed/disabled** until all ★ required fields are filled. |
+| G3 | In a VLAN form, enter VLAN ID `9999`, fill name, Continue | Form **re-pops** with `vlan_id` error "must be between 1 and 4094"; other values preserved; **no LLM re-call** in the log. |
+| G4 | `Create VLAN 30 named FINANCE` | Pre-fill: both values were given, so the form omits them (shows only State, or proceeds straight to the target question). |
+| G5 | `Create a local user` | **Password** renders as a masked input; complete + tail → approval/delivery never shows the password. |
+| G6 | `Configure AAA` → complete → tail | Approval shows **risk HIGH**; **Shared Key never displayed** anywhere. |
+| G7 | `Add a static route` | All three mandatory fields appear in **one** form (the old two-IP ambiguity is gone). |
+| G8 | Fill some fields → **Clear** | All inputs reset to empty. |
+| G9 | Open any form → **Cancel** | "I've discarded that configuration request." Next message starts fresh. |
+| G10 | Any form with **State** | Rendered as a dropdown (`present` / `absent`), not a free-text box. |
+| G11 | `Set up OSPF` → fill all 6 → Continue → `1` → `1` → `approve` | Full path with a large form → manual delivery. |
+
+### Backend log signals
+- First form turn → one `build_form` LLM call.
+- Each **form submit** → **no** extraction LLM call (values merged structurally); only the
+  `preflight` call fires once all mandatory fields are present.
+- Set `CONFIG_USE_FORMS=false` to confirm graceful fallback to conversational text questions.

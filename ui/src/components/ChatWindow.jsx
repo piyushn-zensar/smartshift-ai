@@ -3,7 +3,7 @@ import MessageBubble from './MessageBubble'
 import LoadingIndicator from './LoadingIndicator'
 import '../styles/ChatWindow.css'
 
-function ChatWindow({ messages, isLoading, messagesEndRef, error }) {
+function ChatWindow({ messages, isLoading, messagesEndRef, error, onFormSubmit, onFormCancel }) {
   return (
     <div className="chat-window">
       <div className="messages-container">
@@ -13,9 +13,11 @@ function ChatWindow({ messages, isLoading, messagesEndRef, error }) {
           </div>
         ) : (
           messages.map((message) => (
-            <MessageBubble 
+            <MessageBubble
               key={message.id}
               message={message}
+              onFormSubmit={onFormSubmit}
+              onFormCancel={onFormCancel}
             />
           ))
         )}

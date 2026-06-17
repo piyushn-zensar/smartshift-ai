@@ -29,12 +29,19 @@ function App() {
     scrollToBottom()
   }, [messages])
 
-  const handleSendMessage = async (text, files = []) => {
-    if (!text.trim() && files.length === 0) return
+  const handleSendMessage = async (text, files = [], formValues = null) => {
+    if (!text.trim() && files.length === 0 && !formValues) return
+
+    // For a structured form submission, show a redacted summary as the user's bubble.
+    const userText = formValues
+      ? 'Submitted: ' + Object.entries(formValues)
+          .map(([k, v]) => /pass|key|secret/i.test(k) ? `${k}=***` : `${k}=${v}`)
+          .join(', ')
+      : text
 
     const userMessage = {
       id: Date.now(),
-      text: text,
+      text: userText,
       sender: 'user',
       timestamp: new Date(),
       files: files.map(f => ({
@@ -78,10 +85,11 @@ function App() {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          question: text,
+          question: formValues ? '[form submitted]' : text,
           session_id: sessionId,
           include_context: true,
-          history: history
+          history: history,
+          form_values: formValues
         })
       })
 
@@ -101,7 +109,8 @@ function App() {
         id: Date.now() + 1,
         text: data.response || data.message || data.answer || "I couldn't process that request. Please try again.",
         sender: 'bot',
-        timestamp: new Date()
+        timestamp: new Date(),
+        form: data.form || null
       }
 
       setMessages(prev => [...prev, botMessage])
@@ -122,6 +131,9 @@ function App() {
       setIsLoading(false)
     }
   }
+
+  const handleFormSubmit = (values) => handleSendMessage('[form submitted]', [], values)
+  const handleFormCancel = () => handleSendMessage('cancel')
 
   const handleNewChat = () => {
     setMessages([
@@ -154,11 +166,13 @@ function App() {
         onClose={() => setIsAdminOpen(false)}
       />
       <div className={`chat-container ${!isSidebarOpen ? 'sidebar-closed' : ''}`}>
-        <ChatWindow 
+        <ChatWindow
           messages={messages}
           isLoading={isLoading}
           messagesEndRef={messagesEndRef}
           error={error}
+          onFormSubmit={handleFormSubmit}
+          onFormCancel={handleFormCancel}
         />
         <InputArea 
           onSendMessage={handleSendMessage}
