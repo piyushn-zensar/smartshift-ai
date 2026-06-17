@@ -12,18 +12,25 @@ from langchain_core.output_parsers import PydanticOutputParser
 
 from .. import logger
 from ..decision import llm
-from ..models import ConfigTypeDetection, ConfigFieldExtraction, ConfigConnectionExtraction
+from ..models import (
+    ConfigTypeDetection, ConfigFieldExtraction, ConfigConnectionExtraction,
+    ConfigPreflight, ConfigFormBuild,
+)
 from ..config_registry import config_registry, ConfigTypeSpec
 from ..prompts import (
     CONFIG_TYPE_DETECT_PROMPT,
     CONFIG_FIELD_EXTRACT_PROMPT,
     CONFIG_QUESTION_PROMPT,
     CONFIG_CONNECTION_EXTRACT_PROMPT,
+    CONFIG_PREFLIGHT_PROMPT,
+    CONFIG_FORM_BUILD_PROMPT,
 )
 
 _detect_parser = PydanticOutputParser(pydantic_object=ConfigTypeDetection)
 _extract_parser = PydanticOutputParser(pydantic_object=ConfigFieldExtraction)
 _conn_parser = PydanticOutputParser(pydantic_object=ConfigConnectionExtraction)
+_preflight_parser = PydanticOutputParser(pydantic_object=ConfigPreflight)
+_form_parser = PydanticOutputParser(pydantic_object=ConfigFormBuild)
 
 
 def _llm_text(output: Any) -> str:
@@ -113,6 +120,66 @@ def extract_connection(query: str, collected: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         logger.error("config extract_connection failed: %s", exc)
         return {}
+
+
+def build_form(spec: ConfigTypeSpec, query: str, history: str = "") -> Optional[ConfigFormBuild]:
+    """One combined LLM call: author the form copy AND extract any values already given.
+
+    Constrained to the registry's field names. Returns None on failure so the caller
+    falls back to static ENRICHMENT copy (and no pre-fill)."""
+    lines = []
+    for fname in spec.required_fields + spec.optional_fields:
+        meta = spec.field_meta(fname)
+        eg = f" (e.g. {meta.example})" if meta.example else ""
+        tag = "" if fname in spec.required_fields else " [optional]"
+        lines.append(f"- {fname}: {meta.prompt}{eg}{tag}")
+    field_specs = "\n".join(lines)
+
+    prompt = CONFIG_FORM_BUILD_PROMPT.format(
+        config_type=spec.config_type,
+        field_specs=field_specs,
+        history=history or "(none)",
+        query=query,
+        format_instructions=_form_parser.get_format_instructions(),
+    )
+    try:
+        output = llm.invoke(prompt)
+        result = _form_parser.parse(_llm_text(output))
+        # Keep only extracted values for known, non-empty fields.
+        allowed = set(spec.required_fields) | set(spec.optional_fields)
+        result.extracted = {
+            k: v for k, v in (result.extracted or {}).items()
+            if k in allowed and v not in (None, "", [])
+        }
+        return result
+    except Exception as exc:
+        logger.error("config build_form failed (fallback to static copy): %s", exc)
+        return None
+
+
+def preflight_validate(spec: ConfigTypeSpec, collected: dict[str, Any], playbook_text: str) -> ConfigPreflight:
+    """Validate the collected mandatory properties against the actual playbook.
+
+    Fail-open: any LLM/parse error returns ok=True so the gate is never blocked by an
+    infrastructure problem (the deterministic missing-field check already ran)."""
+    redacted = {
+        k: ("***" if spec.field_meta(k).secret else v)
+        for k, v in (collected or {}).items()
+    }
+    prompt = CONFIG_PREFLIGHT_PROMPT.format(
+        config_type=spec.config_type,
+        required_fields=", ".join(spec.required_fields) or "(none)",
+        optional_fields=", ".join(spec.optional_fields) or "(none)",
+        collected=redacted or "(none)",
+        playbook=(playbook_text or "")[:4000],
+        format_instructions=_preflight_parser.get_format_instructions(),
+    )
+    try:
+        output = llm.invoke(prompt)
+        return _preflight_parser.parse(_llm_text(output))
+    except Exception as exc:
+        logger.error("config preflight_validate failed (fail-open): %s", exc)
+        return ConfigPreflight(ok=True)
 
 
 def phrase_question(message: str) -> str:

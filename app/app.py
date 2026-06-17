@@ -215,7 +215,9 @@ async def askv1_question(request: QueryRequest):
 
         # --- CONFIG intent: stateful refinement loop (see CONFIG_INTENT_PLAN.md) ---
         if tool.strip() == "CONFIG":
-            config_payload = config_service.handle(request.question, session_id)
+            config_payload = config_service.handle(
+                request.question, session_id, form_values=getattr(request, "form_values", None)
+            )
             conversation_store.append_turn(session_id, "user", request.question)
             conversation_store.append_turn(session_id, "assistant", config_payload.get("answer", ""))
             content = {

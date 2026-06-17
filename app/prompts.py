@@ -152,6 +152,65 @@ Message to rewrite:
 {message}
 """
 
+CONFIG_FORM_BUILD_PROMPT = """
+You are preparing an input FORM for a Cisco IOS '{config_type}' configuration change,
+and also extracting any values the user already provided.
+
+Build friendly form copy for EXACTLY these fields — use the exact field `name`s, and do
+NOT add, drop, or rename any:
+{field_specs}
+
+Recent conversation (context; may be empty):
+{history}
+
+User's request:
+{query}
+
+Return:
+- title: a short heading naming the change (e.g. "VLAN Configuration").
+- description: ONE sentence on what this form configures.
+- fields: for each field name above -> {{ "name": <exact name>, "heading": <human label>,
+  "description": <short hint, <=12 words>, "example": <a realistic example value> }}.
+- extracted: a map of field name -> value for ONLY values clearly stated in the request.
+  Never invent values; omit anything the user did not provide.
+
+{format_instructions}
+"""
+
+CONFIG_PREFLIGHT_PROMPT = """
+You are a pre-flight validator for a Cisco IOS configuration change. Given the target
+Ansible playbook and the values collected from the user, decide whether the change is
+ready and safe to prepare.
+
+config_type: {config_type}
+Mandatory properties (the playbook needs ALL of these): {required_fields}
+Optional properties: {optional_fields}
+
+Collected values (secrets shown as ***):
+{collected}
+
+The Ansible playbook that will consume these values (the source of truth):
+-----
+{playbook}
+-----
+
+Validate ONLY against what THIS playbook actually uses:
+1. Is every MANDATORY property present and a plausible value (not a placeholder, not
+   obviously wrong for its purpose on Cisco IOS)?
+2. Are the values mutually consistent and valid (IP addresses, masks/prefixes, ranges,
+   interface names, modes, etc.)?
+3. Any safety concern specific to THIS playbook (lock-out risk, non-idempotent step,
+   service-disrupting change)?
+
+Rules:
+- Set ok=false ONLY for a BLOCKING problem (a mandatory property missing or implausible).
+- Do NOT block on optional properties. Do NOT invent properties the playbook doesn't use.
+- issues: short user-facing blocking problems (empty if none).
+- warnings: short non-blocking cautions to show before approval (empty if none).
+
+{format_instructions}
+"""
+
 CONFIG_CONNECTION_EXTRACT_PROMPT = """
 You extract DEVICE CONNECTION details from a user's message (standalone target mode).
 Extract ONLY these fields, and ONLY when the user actually states them. NEVER invent

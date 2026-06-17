@@ -2,9 +2,10 @@ import React, { useState } from 'react'
 import { Copy, Check, File, Download } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import FormCard from './FormCard'
 import '../styles/MessageBubble.css'
 
-function MessageBubble({ message }) {
+function MessageBubble({ message, onFormSubmit, onFormCancel }) {
   const [copied, setCopied] = useState(false)
 
   const handleCopy = () => {
@@ -31,8 +32,15 @@ function MessageBubble({ message }) {
   return (
     <div className={`message-bubble message-${message.sender} ${message.isError ? 'message-error' : ''}`}>
       <div className="message-content">
+        {message.form ? (
+          <FormCard
+            form={message.form}
+            onSubmit={(values) => onFormSubmit && onFormSubmit(values)}
+            onCancel={() => onFormCancel && onFormCancel()}
+          />
+        ) : (
         <div className="message-text markdown-content">
-          <ReactMarkdown 
+          <ReactMarkdown
             remarkPlugins={[remarkGfm]}
             components={{
               p: ({node, ...props}) => <p {...props} style={{margin: '0.1em 0'}} />,
@@ -58,6 +66,7 @@ function MessageBubble({ message }) {
             {message.text}
           </ReactMarkdown>
         </div>
+        )}
         {message.files && message.files.length > 0 && (
           <div className="message-files">
             <div className="files-label">Attached files</div>

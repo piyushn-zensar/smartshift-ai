@@ -15,7 +15,8 @@ class QueryRequest(BaseModel):
     question: str = Field(..., description="User's question or query")
     session_id: Optional[str] = Field(None, description="Session ID for conversation tracking")
     include_context: Optional[bool] = Field(True, description="Include retrieved context in response")
-    
+    form_values: Optional[dict] = Field(None, description="Structured CONFIG form submission: field -> value")
+
     class Config:
         extra = "allow"  # Allow extra fields
 
@@ -93,6 +94,16 @@ class ConfigState(BaseModel):
     missing_fields: List[str] = Field(default_factory=list)
     candidates: List[str] = Field(default_factory=list)        # disambiguation options offered (§8)
     stage: ConfigStage = ConfigStage.DETECT_TYPE
+    # LLM pre-flight cache (keyed by a signature of collected) to avoid re-calling.
+    preflight_sig: Optional[str] = None
+    preflight_ok: bool = True
+    preflight_issues: List[str] = Field(default_factory=list)
+    preflight_warnings: List[str] = Field(default_factory=list)
+    # Dynamic form: LLM-built copy is generated once and cached here (title/description
+    # + per-field heading/description/example). `initial_extracted` gates the one-time
+    # combined extract+build LLM call.
+    initial_extracted: bool = False
+    form_cache: Optional[Dict[str, Any]] = None
     target_mode: Optional[str] = None                         # "integrated" | "standalone" (future)
     target_device: Optional[Dict[str, Any]] = None
     delivery_mode: str = "manual"                             # "manual" (v1) | "automated" (future)
@@ -120,3 +131,30 @@ class ConfigConnectionExtraction(BaseModel):
     ansible_host: Optional[str] = None
     username: Optional[str] = None
     password: Optional[str] = None
+
+
+class ConfigFormFieldCopy(BaseModel):
+    """LLM-authored presentation copy for one form field (grounded to a registry name)."""
+    name: str
+    heading: str = ""
+    description: str = ""
+    example: Optional[str] = None
+
+
+class ConfigFormBuild(BaseModel):
+    """Combined LLM output: form copy + any values extracted from the opening message."""
+    title: str = ""
+    description: str = ""
+    fields: List[ConfigFormFieldCopy] = Field(default_factory=list)
+    extracted: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ConfigPreflight(BaseModel):
+    """LLM pre-flight validation of collected values against the target playbook.
+
+    `ok` is False only when there is a BLOCKING problem (a mandatory property the
+    playbook needs is missing or implausible). `warnings` are non-blocking cautions
+    surfaced at the approval gate."""
+    ok: bool = True
+    issues: List[str] = Field(default_factory=list, description="Blocking problems, user-facing")
+    warnings: List[str] = Field(default_factory=list, description="Non-blocking cautions")

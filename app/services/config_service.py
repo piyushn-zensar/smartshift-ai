@@ -22,9 +22,11 @@ from typing import Any, Optional
 from .. import logger
 from ..models import ConfigState, ConfigStage
 from ..config_registry import config_registry, ConfigTypeSpec, FieldMeta
-from ..config import CONFIG_LLM_PHRASING
+from ..config import CONFIG_LLM_PHRASING, CONFIG_LLM_PREFLIGHT, CONFIG_USE_FORMS
 from .. import config_inventory
-from ..chains.config_chain import detect_type, extract_fields, extract_connection, phrase_question
+from ..chains.config_chain import (
+    detect_type, extract_fields, extract_connection, phrase_question, preflight_validate, build_form,
+)
 from .conversation_store import conversation_store
 
 MAX_ATTEMPTS = 8
@@ -160,6 +162,26 @@ def _inventory_line(state: ConfigState) -> Optional[str]:
     return " ".join(parts)
 
 
+def _playbook_text(spec: ConfigTypeSpec) -> str:
+    """The vetted playbook YAML (used as grounding for the LLM pre-flight)."""
+    if spec.playbook_file:
+        try:
+            with open(spec.playbook_file, "r", encoding="utf-8") as fh:
+                return fh.read()
+        except OSError as exc:
+            logger.error("Could not read playbook %r: %s", spec.playbook_file, exc)
+    return ""
+
+
+def _preflight_message(issues: list[str]) -> str:
+    lines = ["Before I prepare this change, a few things need attention:"]
+    for i in issues:
+        lines.append(f"  • {i}")
+    lines.append("")
+    lines.append("Please correct these and resend.")
+    return "\n".join(lines)
+
+
 def _render_manual(spec: ConfigTypeSpec, state: ConfigState) -> dict:
     """Produce the manual-delivery payload: the vetted playbook (unchanged) plus the
     ready-to-run ansible-playbook command with collected values as extra-vars."""
@@ -227,6 +249,59 @@ def _redact(state: ConfigState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# dynamic form (LLM-built copy, grounded to the registry contract)
+# ---------------------------------------------------------------------------
+def _widget_type(meta: FieldMeta) -> str:
+    """Input widget for a field, derived from its validator (backend-owned)."""
+    if meta.secret:
+        return "password"
+    if meta.validate_as in ("int", "vlan_id", "prefix"):
+        return "number"
+    if meta.validate_as == "state":
+        return "select"
+    return "text"
+
+
+def _build_form(spec: ConfigTypeSpec, state: ConfigState, missing: list[str], errors: dict[str, str]) -> dict:
+    """Assemble the form card: LLM copy (cached) reconciled with the registry contract.
+
+    Shows fields not yet collected (required + optional), plus any that failed validation.
+    Field order follows the registry (required first, then optional). The LLM never adds,
+    drops, or types fields — it only supplies headings/descriptions/examples."""
+    copy = (state.form_cache or {}).get("fields", {})       # {name: {heading, description, example}}
+    title = (state.form_cache or {}).get("title") or f"{spec.config_type.replace('_', ' ').title()} Configuration"
+    description = (state.form_cache or {}).get("description") or ""
+
+    # Fields to show: required+optional that aren't validly collected yet (errors included
+    # since invalid values are not stored), in registry order.
+    show = [f for f in (spec.required_fields + spec.optional_fields) if f not in state.collected]
+    fields = []
+    for fname in show:
+        meta = spec.field_meta(fname)
+        c = copy.get(fname, {})
+        field = {
+            "name": fname,
+            "heading": c.get("heading") or fname.replace("_", " ").title(),
+            "description": c.get("description") or meta.prompt,
+            "example": c.get("example") or meta.example,
+            "type": _widget_type(meta),
+            "required": fname in spec.required_fields,
+            "value": None,
+            "error": errors.get(fname),
+        }
+        if field["type"] == "select":
+            field["options"] = ["present", "absent"]
+        fields.append(field)
+
+    return {
+        "title": title,
+        "description": description,
+        "fields": fields,
+        "actions": {"submit": "Continue", "clear": "Clear", "cancel": "Cancel"},
+    }
+
+
+# ---------------------------------------------------------------------------
 # message composers
 # ---------------------------------------------------------------------------
 def _collect_message(spec: ConfigTypeSpec, missing: list[str], errors: dict[str, str]) -> str:
@@ -285,6 +360,11 @@ def _approval_summary(spec: ConfigTypeSpec, state: ConfigState) -> str:
         lines.append("")
         lines.append("⚠️  This is a HIGH-RISK change (command-template based, not idempotent). "
                      "Run it with `--check` first.")
+    if state.preflight_warnings:
+        lines.append("")
+        lines.append("Heads-up (pre-flight):")
+        for w in state.preflight_warnings:
+            lines.append(f"  • {w}")
     lines.append("")
     lines.append('Reply "approve" to proceed, or tell me what to change.')
     return "\n".join(lines)
@@ -438,7 +518,7 @@ class ConfigService:
             lines.append(f"  • {p} — e.g. {e}")
         return "\n".join(lines)
 
-    def handle(self, message: str, session_id: str) -> dict:
+    def handle(self, message: str, session_id: str, form_values: Optional[dict] = None) -> dict:
         state = conversation_store.get_config_state(session_id)
         if state is None:
             state = ConfigState()
@@ -504,7 +584,7 @@ class ConfigService:
             state.stage = ConfigStage.DONE
             return _resp("That configuration type isn't available.", state, "none")
 
-        # ---- 2/3. extract + merge + validate ----
+        # ---- 2/3. gather field values ----
         # Interpret the reply in context: while RESOLVE_TARGET is active the message
         # is a mode/device/connection answer, not a config field — so skip extraction.
         errors: dict[str, str] = {}
@@ -513,8 +593,28 @@ class ConfigService:
         in_target = state.stage == ConfigStage.RESOLVE_TARGET
         if not approve_signal and not in_target:
             before = dict(state.collected)
-            extracted = extract_fields(state.config_type, message, state.collected, history, spec)
-            state.collected, errors = _merge_and_validate(spec, state.collected, extracted)
+            if form_values:
+                # Structured form submission -> merge directly, NO LLM, no NL parsing.
+                state.collected, errors = _merge_and_validate(spec, state.collected, form_values)
+            elif CONFIG_USE_FORMS and not state.initial_extracted:
+                # First turn with forms on: ONE combined LLM call (extract + build copy).
+                fb = build_form(spec, message, history)
+                state.initial_extracted = True
+                if fb is not None:
+                    state.form_cache = {
+                        "title": fb.title,
+                        "description": fb.description,
+                        "fields": {fc.name: {"heading": fc.heading, "description": fc.description,
+                                             "example": fc.example} for fc in fb.fields},
+                    }
+                    extracted = fb.extracted
+                else:
+                    extracted = extract_fields(state.config_type, message, state.collected, history, spec)
+                state.collected, errors = _merge_and_validate(spec, state.collected, extracted)
+            else:
+                # Forms off, OR a typed free-text reply after the form was shown (fallback).
+                extracted = extract_fields(state.config_type, message, state.collected, history, spec)
+                state.collected, errors = _merge_and_validate(spec, state.collected, extracted)
             if state.collected != before:
                 state.attempts = 1  # forward progress: a slot changed -> reset the cap
             if at_gate:
@@ -526,7 +626,27 @@ class ConfigService:
         if errors or missing:
             state.stage = ConfigStage.COLLECT_FIELDS
             conversation_store.set_config_state(session_id, state)
+            if CONFIG_USE_FORMS:
+                form = _build_form(spec, state, missing, errors)
+                answer = _collect_message(spec, missing, errors)  # text fallback for non-form clients
+                return _resp(answer, state, "form", extra={"form": form})
             return _resp(self._phrase(_collect_message(spec, missing, errors)), state, "user_input")
+
+        # ---- 4a. LLM pre-flight: validate the collected values against the playbook ----
+        # (semantic/safety pass; the deterministic presence/format check already passed).
+        # Cached per collected-signature so we don't re-call the LLM every turn.
+        if CONFIG_LLM_PREFLIGHT and not approve_signal:
+            pf_sig = _signature(state.config_type, state.collected)
+            if pf_sig != state.preflight_sig:
+                pf = preflight_validate(spec, state.collected, _playbook_text(spec))
+                state.preflight_sig = pf_sig
+                state.preflight_ok = pf.ok
+                state.preflight_issues = pf.issues or []
+                state.preflight_warnings = pf.warnings or []
+            if not state.preflight_ok:
+                state.stage = ConfigStage.COLLECT_FIELDS
+                conversation_store.set_config_state(session_id, state)
+                return _resp(self._phrase(_preflight_message(state.preflight_issues)), state, "user_input")
 
         # ---- 4b. resolve target: mode choice -> device picker / standalone details ----
         target_prompt = self._resolve_target(message, state, spec)

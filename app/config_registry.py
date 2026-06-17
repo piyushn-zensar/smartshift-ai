@@ -1,25 +1,30 @@
 """
-CONFIG-intent playbook registry + mapping.
+CONFIG-intent playbook registry.
 
-Single source of truth for the CONFIG refinement loop and (future) execution layer.
+The PLAYBOOK FILES ARE THE SINGLE SOURCE OF TRUTH. There is no required_fields.yaml
+anymore — the contract for each config type is derived directly from the vetted
+playbook by walking `repositories/playbook-registry/<category>/*.yml` and parsing:
 
-Two layers are merged here:
-  1. The vetted *playbook contract* — loaded from the colleague's
-     `repositories/playbook-registry/required_fields.yaml`:
-        config_type -> {playbook, target_group, required_fields, optional_fields, risk}
-     This file is authoritative for field NAMES and risk; do not duplicate it.
-  2. Agent-specific *refinement metadata* (this file): per-type `keywords`, a
-     disambiguation `example`, and per-field prompt/example/validator. The loop reads
-     these to ask dynamic follow-up questions; they are NOT part of the playbook
-     contract, so they live alongside rather than inside the YAML.
+  • config_type   — from the `# CONFIG intent: <TYPE>` header
+  • category       — from the containing sub-directory (management/layer2/…)
+  • required_fields / optional_fields — from the `# required_fields:` / `# optional:`
+                     header lines (author intent), cross-checked with the playbook's
+                     Jinja `{{ vars }}`
+  • target_group   — from `hosts: "{{ target_hosts | default('…') }}"`
+  • risk           — `high` when the playbook pushes command templates
+                     (`ios_config` + `lines:`), else `low`
 
-Adding a new config type = add a playbook + a `required_fields.yaml` entry + (optionally)
-a keywords/field block below. No other code changes.
+A second layer, ENRICHMENT (below, keyed by config_type), adds agent-side refinement
+metadata that is NOT part of the playbook contract: per-type `keywords`, a
+disambiguation `example`, and per-field prompt/example/validator.
+
+Adding a new config type = drop a playbook in the right category folder (with the
+standard header comments) + optionally a keywords/field block below. No other changes.
 """
 import os
+import re
 from typing import Optional
 
-import yaml
 from pydantic import BaseModel, Field
 
 from . import logger
@@ -31,13 +36,16 @@ DEFAULT_REGISTRY_DIR = os.path.normpath(
     os.path.join(BASE_DIR, "..", "repositories", "playbook-registry")
 )
 REGISTRY_DIR = os.getenv("CONFIG_REGISTRY_DIR", DEFAULT_REGISTRY_DIR)
-MAPPING_FILE = os.path.join(REGISTRY_DIR, "required_fields.yaml")
+
+# Sensible display/iteration order for types (by domain).
+_CATEGORY_ORDER = ["management", "layer2", "layer3", "security", "services",
+                   "redundancy", "segmentation", "general"]
 
 
 # ---------------------------------------------------------------------------
 # Agent-side refinement metadata (keywords + per-field prompts + disambig example)
-# Keyed by config_type. Field metadata is keyed by the EXACT field name from
-# required_fields.yaml so the two layers line up.
+# Keyed by config_type. Field metadata is keyed by the EXACT field name the playbook
+# uses so the two layers line up.
 # ---------------------------------------------------------------------------
 ENRICHMENT: dict[str, dict] = {
     "hostname": {
@@ -243,9 +251,8 @@ class FieldMeta(BaseModel):
 
 class ConfigTypeSpec(BaseModel):
     config_type: str
-    playbook_ref: str = Field(..., description="Playbook path as written in required_fields.yaml")
     playbook_file: Optional[str] = Field(None, description="Resolved absolute path on disk, if found")
-    playbook_name: str = Field(..., description="Playbook basename, e.g. vlan.yml")
+    playbook_name: str = Field("", description="Playbook basename, e.g. vlan.yml")
     playbook_rel: str = Field("", description="Path relative to the registry, e.g. layer2/vlan.yml")
     category: str = Field("general", description="Domain classification: management/layer2/layer3/security/services/redundancy/segmentation")
     target_group: str = "all"
@@ -267,56 +274,102 @@ class ConfigTypeSpec(BaseModel):
         )
 
 
-class ConfigRegistry:
-    """Loads + merges the playbook contract and the refinement metadata."""
+def _clean_field_list(raw: str) -> list[str]:
+    """Parse a `# required_fields:`/`# optional:` header value into field names.
 
-    def __init__(self, mapping_file: str = MAPPING_FILE, registry_dir: str = REGISTRY_DIR):
-        self.mapping_file = mapping_file
+    Strips parenthetical notes ("member_interfaces (list)" -> "member_interfaces"),
+    handles "(none)"/empty, and de-dupes while preserving order.
+    """
+    raw = (raw or "").strip()
+    if not raw or raw.lower() in ("(none)", "none", "-"):
+        return []
+    out: list[str] = []
+    for part in raw.split(","):
+        name = re.sub(r"\(.*?\)", "", part).strip()           # drop "(...)" notes
+        name = name.strip(" .`")
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def parse_playbook_contract(text: str) -> dict:
+    """Derive a config type's contract straight from the vetted playbook text.
+
+    The playbook is the single source of truth — see module docstring.
+    """
+    # config_type: first token after "CONFIG intent:"
+    m = re.search(r"#\s*CONFIG intent:\s*([A-Za-z0-9_]+)", text)
+    config_type = m.group(1).lower() if m else None
+
+    req_m = re.search(r"#\s*required_fields?:\s*(.+)", text)
+    opt_m = re.search(r"#\s*optional:\s*(.+)", text)
+    required = _clean_field_list(req_m.group(1)) if req_m else []
+    optional = _clean_field_list(opt_m.group(1)) if opt_m else []
+
+    # target group from `hosts: "{{ target_hosts | default('routers') }}"`
+    tg = re.search(r"target_hosts\s*\|\s*default\(\s*'([^']+)'\s*\)", text)
+    target_group = tg.group(1) if tg else "all"
+
+    # risk: command-template playbooks (ios_config + lines:) are high-risk.
+    risk = "high" if ("ios_config" in text and "lines:" in text) else "low"
+
+    return {
+        "config_type": config_type,
+        "required_fields": required,
+        "optional_fields": optional,
+        "target_group": target_group,
+        "risk": risk,
+    }
+
+
+class ConfigRegistry:
+    """Builds the type catalogue by parsing the vetted playbooks (no YAML index)."""
+
+    def __init__(self, registry_dir: str = REGISTRY_DIR):
         self.registry_dir = registry_dir
         self._specs: dict[str, ConfigTypeSpec] = {}
         self._load()
 
-    def _find_playbook(self, basename: str) -> Optional[str]:
-        """Locate a playbook by basename anywhere under the registry directory."""
+    def _discover_playbooks(self) -> list[str]:
+        """All *.yml/*.yaml playbooks under the registry (skip non-playbook files)."""
+        found = []
         for root, _dirs, files in os.walk(self.registry_dir):
-            if basename in files:
-                return os.path.join(root, basename)
-        return None
+            for fn in files:
+                if fn.lower().endswith((".yml", ".yaml")):
+                    found.append(os.path.join(root, fn))
+        return sorted(found)
 
     def _load(self) -> None:
-        if not os.path.exists(self.mapping_file):
-            logger.error("CONFIG registry mapping not found at %r", self.mapping_file)
+        if not os.path.isdir(self.registry_dir):
+            logger.error("CONFIG registry dir not found at %r", self.registry_dir)
             self._specs = {}
             return
 
-        with open(self.mapping_file, "r", encoding="utf-8") as fh:
-            mapping = yaml.safe_load(fh) or {}
-
         specs: dict[str, ConfigTypeSpec] = {}
-        for config_type, entry in mapping.items():
-            entry = entry or {}
-            enrich = ENRICHMENT.get(config_type, {})
-            playbook_ref = entry.get("playbook", "")
-            playbook_name = os.path.basename(playbook_ref) if playbook_ref else ""
-            # Path relative to the registry: drop a leading "playbooks/" convention prefix.
-            rel = playbook_ref[len("playbooks/"):] if playbook_ref.startswith("playbooks/") else playbook_ref
-            resolved = os.path.join(self.registry_dir, *rel.split("/")) if rel else None
-            if resolved and not os.path.exists(resolved):
-                # Fallback: locate the basename anywhere under the registry (resilient to
-                # category/path drift between the mapping and the actual folder layout).
-                found = self._find_playbook(playbook_name) if playbook_name else None
-                if found:
-                    resolved = found
-                    rel = os.path.relpath(found, self.registry_dir).replace(os.sep, "/")
-                else:
-                    logger.warning(
-                        "CONFIG type %r references playbook %r which is missing on disk",
-                        config_type, playbook_ref,
-                    )
-                    resolved = None
+        for path in self._discover_playbooks():
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    text = fh.read()
+            except OSError as exc:
+                logger.warning("CONFIG registry: cannot read %r: %s", path, exc)
+                continue
 
-            required = list(entry.get("required_fields", []) or [])
-            optional = list(entry.get("optional_fields", []) or [])
+            contract = parse_playbook_contract(text)
+            config_type = contract["config_type"]
+            if not config_type:
+                # Not a CONFIG playbook (e.g. a stray file) — skip silently.
+                continue
+            if config_type in specs:
+                logger.warning("CONFIG registry: duplicate type %r (%s) — keeping first",
+                               config_type, path)
+                continue
+
+            rel = os.path.relpath(path, self.registry_dir).replace(os.sep, "/")
+            category = rel.split("/")[0] if "/" in rel else "general"
+
+            enrich = ENRICHMENT.get(config_type, {})
+            required = contract["required_fields"]
+            optional = contract["optional_fields"]
             field_enrich = enrich.get("fields", {})
 
             fields: dict[str, FieldMeta] = {}
@@ -333,22 +386,28 @@ class ConfigRegistry:
 
             specs[config_type] = ConfigTypeSpec(
                 config_type=config_type,
-                playbook_ref=playbook_ref,
-                playbook_file=resolved,
-                playbook_name=playbook_name,
+                playbook_file=path,
+                playbook_name=os.path.basename(path),
                 playbook_rel=rel,
-                category=entry.get("category", "general"),
-                target_group=entry.get("target_group", "all"),
+                category=category,
+                target_group=contract["target_group"],
                 required_fields=required,
                 optional_fields=optional,
-                risk=entry.get("risk", "low"),
+                risk=contract["risk"],
                 keywords=enrich.get("keywords", []),
                 example=enrich.get("example"),
                 fields=fields,
             )
 
-        self._specs = specs
-        logger.info("CONFIG registry loaded %d config types from %r", len(specs), self.mapping_file)
+        # Order by domain for stable iteration / disambiguation examples.
+        def _sort_key(item):
+            cat = item[1].category
+            return (_CATEGORY_ORDER.index(cat) if cat in _CATEGORY_ORDER else 99,
+                    item[1].config_type)
+
+        self._specs = dict(sorted(specs.items(), key=_sort_key))
+        logger.info("CONFIG registry derived %d config types from playbooks in %r",
+                    len(self._specs), self.registry_dir)
 
     # ----- public API -----
     def types(self) -> list[str]:
