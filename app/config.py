@@ -50,10 +50,6 @@ RAG_TOP_K = 5
 RAG_INDEX_PATH = "data/rag_index"
 MEMORY_BASE_PATH = "data/session_memory"
 
-# Database connection. Prefer a full MYSQL_URI from the environment; otherwise build it
-# from individual parts. The password is read raw from MYSQL_PASSWORD and URL-encoded
-# here, so special characters (e.g. '@') need no manual escaping in the .env file.
-# Never hardcode the password in source — set it in the gitignored .env instead.
 MYSQL_URI = os.getenv("MYSQL_URI")
 if not MYSQL_URI:
     _mysql_user = os.getenv("MYSQL_USER", "root")
