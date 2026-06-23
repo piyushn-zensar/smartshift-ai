@@ -34,9 +34,13 @@ function App() {
 
     // For a structured form submission, show a redacted summary as the user's bubble.
     const userText = formValues
-      ? 'Submitted: ' + Object.entries(formValues)
-          .map(([k, v]) => /pass|key|secret/i.test(k) ? `${k}=***` : `${k}=${v}`)
-          .join(', ')
+      ? (Array.isArray(formValues.devices)
+          ? `Submitted ${formValues.devices.length} device(s): `
+            + formValues.devices.map(d => d.device_name || '?').join(', ')
+            + ' (credentials hidden)'
+          : 'Submitted: ' + Object.entries(formValues)
+              .map(([k, v]) => /pass|key|secret/i.test(k) ? `${k}=***` : `${k}=${v}`)
+              .join(', '))
       : text
 
     const userMessage = {

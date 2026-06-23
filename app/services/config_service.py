@@ -149,10 +149,22 @@ def _merge_and_validate(spec: ConfigTypeSpec, collected: dict, extracted: dict) 
 # ---------------------------------------------------------------------------
 # rendering (manual delivery)
 # ---------------------------------------------------------------------------
+def _devices(state: ConfigState) -> list[dict]:
+    """The resolved target device(s) as a list. Prefers the multi-device list; falls back
+    to the single `target_device` (so all single-device behaviour is unchanged)."""
+    if state.target_devices:
+        return list(state.target_devices)
+    if state.target_device:
+        return [state.target_device]
+    return []
+
+
 def _target_hosts(spec: ConfigTypeSpec, state: ConfigState) -> str:
-    """The Ansible host pattern: the chosen device if any, else the mapping group."""
-    if state.target_device and state.target_device.get("device_name"):
-        return state.target_device["device_name"]
+    """The Ansible host pattern: the chosen device(s) if any, else the mapping group.
+    Multiple devices render as a comma-separated pattern (a valid Ansible host pattern)."""
+    names = [d["device_name"] for d in _devices(state) if d.get("device_name")]
+    if names:
+        return ",".join(names)
     return spec.target_group
 
 
@@ -164,15 +176,18 @@ def _extra_vars(spec: ConfigTypeSpec, state: ConfigState) -> dict:
 
 
 def _inventory_line(state: ConfigState) -> Optional[str]:
-    """A sample inventory.ini line for the chosen device (password never written)."""
-    td = state.target_device or {}
-    if not td.get("device_name") or not td.get("ansible_host"):
-        return None
-    parts = [td["device_name"], f"ansible_host={td['ansible_host']}"]
-    if td.get("username"):
-        parts.append(f"ansible_user={td['username']}")
-    parts.append("ansible_network_os=cisco.ios.ios")
-    return " ".join(parts)
+    """Sample inventory.ini line(s) for the chosen device(s) (password never written).
+    One line per device; returns None if no device has the minimum connectivity fields."""
+    lines: list[str] = []
+    for td in _devices(state):
+        if not td.get("device_name") or not td.get("ansible_host"):
+            continue
+        parts = [td["device_name"], f"ansible_host={td['ansible_host']}"]
+        if td.get("username"):
+            parts.append(f"ansible_user={td['username']}")
+        parts.append("ansible_network_os=cisco.ios.ios")
+        lines.append(" ".join(parts))
+    return "\n".join(lines) if lines else None
 
 
 def _playbook_text(spec: ConfigTypeSpec) -> str:
@@ -241,6 +256,7 @@ def _resp(answer: str, state: ConfigState, awaiting: str, extra: Optional[dict] 
         "missing_fields": state.missing_fields,
         "delivery_mode": state.delivery_mode,
         "target_device": _redact_target(state),
+        "target_devices": _redact_targets(state),
         "awaiting": awaiting,
     }
     if extra:
@@ -262,13 +278,22 @@ def _redact(state: ConfigState) -> dict:
     return out
 
 
-def _redact_target(state: ConfigState) -> Optional[dict]:
-    """Connection info safe to echo to the client: the password is always masked."""
-    td = state.target_device
-    if not td:
-        return None
+def _mask_conn(td: dict) -> dict:
+    """Mask secret connection fields (e.g. password) in a single device dict."""
     return {k: ("***" if _CONN_META.get(k, FieldMeta(name=k, required=False, prompt="")).secret else v)
-            for k, v in td.items()}
+            for k, v in (td or {}).items()}
+
+
+def _redact_target(state: ConfigState) -> Optional[dict]:
+    """The single/primary device, safe to echo (password masked). Back-compat field."""
+    devs = _devices(state)
+    return _mask_conn(devs[0]) if devs else None
+
+
+def _redact_targets(state: ConfigState) -> Optional[list]:
+    """All resolved device(s), safe to echo (passwords masked)."""
+    devs = _devices(state)
+    return [_mask_conn(d) for d in devs] if devs else None
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +365,28 @@ def _merge_conn(conn: dict, values: dict, fields: list[str]) -> tuple[dict, dict
     return merged, errors
 
 
+def _merge_conn_list(rows: list, fields: list[str]) -> tuple[list[dict], dict[int, dict]]:
+    """Validate a list of connection rows (multi-device standalone submission), NO LLM.
+
+    Returns (validated_rows, row_errors) where row_errors maps a row index to a
+    {field: message} dict for any row that has an invalid OR missing required field.
+    A row that is entirely empty is skipped (lets the client leave a trailing blank row)."""
+    validated: list[dict] = []
+    row_errors: dict[int, dict] = {}
+    for row in (rows or []):
+        row = row or {}
+        if not any(str(row.get(f, "")).strip() for f in fields):
+            continue  # blank row -> ignore
+        conn, errs = _merge_conn({}, row, fields)
+        for f in fields:
+            if not conn.get(f) and f not in errs:
+                errs[f] = "required"
+        if errs:
+            row_errors[len(validated)] = errs
+        validated.append(conn)
+    return validated, row_errors
+
+
 def _build_connection_form(state: ConfigState, missing: list[str], errors: dict[str, str],
                            mode: str, fields: list[str]) -> dict:
     """Form card for the target's connection details — same shape/widgets as the config
@@ -363,7 +410,7 @@ def _build_connection_form(state: ConfigState, missing: list[str], errors: dict[
         description = ("Provide the device's connection details. Credentials are used only "
                        "for this session — never stored or logged.")
     else:
-        dev = (state.target_device or {}).get("device_name", "this device")
+        dev = (_devices(state)[0] if _devices(state) else {}).get("device_name", "this device")
         title = "Complete Device Details"
         description = (f"Some connection details for **{dev}** are missing from the inventory. "
                        "Please provide them to continue.")
@@ -372,6 +419,34 @@ def _build_connection_form(state: ConfigState, missing: list[str], errors: dict[
         "description": description,
         "fields": field_cards,
         "actions": {"submit": "Continue", "clear": "Clear", "cancel": "Cancel"},
+    }
+
+
+def _build_multi_connection_form(row_errors: dict[int, dict]) -> dict:
+    """Repeatable standalone connection form: one row template the client renders 1..N
+    times. Same widgets/masking as the single form (password -> masked). Values are never
+    pre-filled by the backend; the client retains its own rows across re-validation."""
+    field_template = []
+    for fname in _STANDALONE_CONN_FIELDS:
+        meta = _CONN_META[fname]
+        field_template.append({
+            "name": fname,
+            "heading": fname.replace("_", " ").title(),
+            "description": meta.prompt,
+            "example": meta.example,
+            "type": _widget_type(meta),       # password -> masked input on the client
+            "required": True,
+        })
+    return {
+        "title": "Device Connections (Standalone)",
+        "description": ("Add one or more devices — the same configuration is applied to "
+                        "each. Credentials are used only for this session, never stored or logged."),
+        "repeatable": True,
+        "form_kind": "connection_multi",
+        "fields": field_template,
+        "row_errors": {str(k): v for k, v in (row_errors or {}).items()},
+        "actions": {"submit": "Continue", "addRow": "Add device",
+                    "removeRow": "Remove", "clear": "Clear", "cancel": "Cancel"},
     }
 
 
@@ -400,13 +475,17 @@ def _collect_message(spec: ConfigTypeSpec, missing: list[str], errors: dict[str,
 
 
 def _target_summary(state: ConfigState) -> str:
-    """One-line description of the resolved target (password never shown)."""
-    td = state.target_device or {}
+    """One-line description of the resolved target(s) (password never shown)."""
     mode = state.target_mode or "?"
-    if td.get("device_name"):
+    devs = _devices(state)
+    if not devs:
+        return mode
+    names = []
+    for td in devs:
         host = f" ({td['ansible_host']})" if td.get("ansible_host") else ""
-        return f"{td['device_name']}{host}  [{mode}]"
-    return mode
+        names.append(f"{td.get('device_name', '?')}{host}")
+    label = names[0] if len(names) == 1 else f"{len(names)} devices: " + ", ".join(names)
+    return f"{label}  [{mode}]"
 
 
 def _approval_summary(spec: ConfigTypeSpec, state: ConfigState) -> str:
@@ -501,9 +580,12 @@ class ConfigService:
 
     # ----- target resolution (§10.2) -----
     def _resolve_target(self, message: str, state: ConfigState, spec: ConfigTypeSpec,
-                        form_values: Optional[dict] = None):
+                        form_values: Optional[dict] = None, device_rows: Optional[list] = None):
         """Drive RESOLVE_TARGET one step per turn. Returns a response dict while more
-        input is needed, or None once the target is fully resolved."""
+        input is needed, or None once the target is fully resolved.
+
+        `device_rows` carries a multi-device standalone submission (the repeatable form's
+        `devices` list); single-device and integrated targeting ignore it."""
         m = (message or "").strip().lower()
 
         # 1) choose the mode (Integrated vs Standalone) — no fixed default (decision J).
@@ -519,15 +601,32 @@ class ConfigService:
         # 2) integrated -> pick a device from config_inventory, then fill any connection
         #    fields the inventory row is missing (asked via the same form mechanism).
         if state.target_mode == "integrated":
-            if state.target_device is None:
+            if state.target_device is None and not state.target_devices:
                 devices = config_inventory.list_devices(spec.target_group) or config_inventory.list_devices()
                 if not just_set_mode:
-                    picked = self._resolve_device(message, devices)
-                    if picked:
-                        state.target_device = picked.public()  # password never stored here
-                        logger.info("CONFIG target device picked: %r", picked.device_name)
-                if state.target_device is None:
+                    picked = self._resolve_devices(message, devices)
+                    if len(picked) == 1:
+                        # single pick -> existing path (allows per-device field completion below).
+                        state.target_device = picked[0].public()  # password never stored here
+                        logger.info("CONFIG target device picked: %r", picked[0].device_name)
+                    elif len(picked) > 1:
+                        # multi-select: integrated creds come from inventory, so we require
+                        # complete records rather than prompting per device.
+                        rows = [p.public() for p in picked]
+                        incomplete = [r.get("device_name", "?") for r in rows
+                                      if any(not r.get(f) for f in _INTEGRATED_CONN_FIELDS)]
+                        if incomplete:
+                            return _resp(self._incomplete_devices_message(incomplete, devices, spec),
+                                         state, "choose_device")
+                        state.target_devices = rows
+                        logger.info("CONFIG target devices picked: %s",
+                                    [r.get("device_name") for r in rows])
+                if state.target_device is None and not state.target_devices:
                     return _resp(self._device_picker_question(devices, spec), state, "choose_device")
+
+            # multi-device integrated rows are complete by construction -> nothing more to ask.
+            if state.target_devices:
+                return None
 
             # apply user-supplied values only once we've started asking for missing fields
             # (so the device-pick reply itself is never read as a field value).
@@ -545,11 +644,27 @@ class ConfigService:
             return None
 
         # 3) standalone -> collect connection details (transient, session-only).
+        #    Forms on: a repeatable form gathers 1..N devices in a single submission
+        #    (structured merge, NO LLM). Forms off: single-device free-text (unchanged).
         if state.target_mode == "standalone":
+            if CONFIG_USE_FORMS:
+                row_errors: dict[int, dict] = {}
+                if not just_set_mode and device_rows is not None:
+                    validated, row_errors = _merge_conn_list(device_rows, _STANDALONE_CONN_FIELDS)
+                    if not row_errors and validated:
+                        state.target_devices = validated
+                devices = _devices(state)
+                complete = bool(devices) and all(
+                    all(d.get(f) for f in _STANDALONE_CONN_FIELDS) for d in devices)
+                if row_errors or not complete:
+                    return self._standalone_form_response(state, row_errors)
+                return None
+
+            # forms off: single-device, free-text extraction (existing behaviour, unchanged).
             conn = dict(state.target_device or {})
-            errors = {}
+            errors: dict[str, str] = {}
             if not just_set_mode:
-                values = form_values if form_values else extract_connection(message, conn)
+                values = extract_connection(message, conn)
                 conn, errors = _merge_conn(conn, values, _STANDALONE_CONN_FIELDS)
                 state.target_device = conn
             missing = [f for f in _STANDALONE_CONN_FIELDS if not conn.get(f)]
@@ -570,6 +685,17 @@ class ConfigService:
             return _resp(self._connection_question(asks), state, "form", extra={"form": form})
         return _resp(self._phrase(self._connection_question(asks)), state, "user_input")
 
+    def _standalone_form_response(self, state: ConfigState, row_errors: dict[int, dict]) -> dict:
+        """Render the repeatable standalone connection form (1..N devices, no LLM)."""
+        form = _build_multi_connection_form(row_errors)
+        if row_errors:
+            msg = "Some device rows need fixing — please correct the highlighted fields."
+        else:
+            msg = ("Add the device(s) this should run on — you can add more than one, and the "
+                   "same configuration is applied to each. Credentials are used only for this "
+                   "session and are never stored or logged.")
+        return _resp(msg, state, "form", extra={"form": form})
+
     def _parse_mode(self, m: str) -> Optional[str]:
         if any(w in m for w in ("standalone", "myself", "provide", "supply", "manual creds")) or m.strip() == "2":
             return "standalone"
@@ -577,20 +703,46 @@ class ConfigService:
             return "integrated"
         return None
 
-    def _resolve_device(self, message: str, devices: list):
+    def _resolve_devices(self, message: str, devices: list) -> list:
+        """Resolve one OR MORE inventory devices from a picker reply:
+          • numeric multi-select — '1,3,5', '1 and 3', '2' (indices >9 supported);
+          • device name / management IP (one or several substrings).
+        Returns the matched devices in selection order (empty list if none matched)."""
         m = (message or "").strip().lower()
-        if len(m.split()) <= 3:
-            num = re.search(r"\b([1-9])\b", m)
-            if num:
-                idx = int(num.group(1)) - 1
-                if 0 <= idx < len(devices):
-                    return devices[idx]
+        picked: list = []
+
+        # numeric pick — only when the reply is essentially just numbers/separators, so a
+        # rephrased sentence containing a digit is never misread as a selection.
+        mm = m.replace(" and ", ",").replace("&", ",")
+        if mm and re.fullmatch(r"[\d,\s]+", mm):
+            for n in re.findall(r"\d+", mm):
+                idx = int(n) - 1
+                if 0 <= idx < len(devices) and devices[idx] not in picked:
+                    picked.append(devices[idx])
+            if picked:
+                return picked
+
+        # name / IP match (may select several). Guard against blank inventory fields:
+        # "" in m is always True, which would make an incomplete row match every reply.
         for d in devices:
-            # guard against blank inventory fields: "" in m is always True, which would
-            # make an incomplete row match every reply and shadow the real pick.
             if (d.device_name and d.device_name.lower() in m) or (d.ansible_host and d.ansible_host in m):
-                return d
-        return None
+                if d not in picked:
+                    picked.append(d)
+        return picked
+
+    def _incomplete_devices_message(self, names: list[str], devices: list,
+                                    spec: ConfigTypeSpec) -> str:
+        """Picker re-prompt when a multi-select includes devices missing inventory creds."""
+        lines = [
+            "Some of those devices don't have complete connection details in the inventory: "
+            + ", ".join(names) + ".",
+            "For multi-device targeting I use the inventory's stored credentials, so please "
+            "select devices that have complete records — or pick a single device and I'll help "
+            "you fill in what's missing.",
+            "",
+            self._device_picker_question(devices, spec),
+        ]
+        return "\n".join(lines)
 
     def _target_mode_question(self) -> str:
         return "\n".join([
@@ -606,7 +758,8 @@ class ConfigService:
         for i, d in enumerate(devices, 1):
             lines.append(f"  {i}. {d.device_name} ({d.ansible_host}) — {d.platform}")
         lines.append("")
-        lines.append("Reply with the number or the device name.")
+        lines.append("Reply with the number or the device name. To target several at once, "
+                     "list them (e.g. `1,3` or `1 and 3`).")
         return "\n".join(lines)
 
     def _connection_question(self, missing_conn: list[str]) -> str:
@@ -725,6 +878,12 @@ class ConfigService:
         at_gate = state.stage == ConfigStage.CONFIRM_APPROVAL
         approve_signal = at_gate and _is_approve(message)
         in_target = state.stage == ConfigStage.RESOLVE_TARGET
+        # Multi-device standalone payloads ride in their own `devices` key. Pop it so it
+        # never reaches the config-field merge, and hand it to target resolution. Single-
+        # device / integrated payloads (a flat field->value dict) are unaffected.
+        device_rows = None
+        if isinstance(form_values, dict) and isinstance(form_values.get("devices"), list):
+            device_rows = form_values.pop("devices")
         if not approve_signal and not in_target:
             before = dict(state.collected)
             if form_values:
@@ -793,7 +952,7 @@ class ConfigService:
                 return _resp(self._phrase(_preflight_message(state.preflight_issues)), state, "user_input")
 
         # ---- 4b. resolve target: mode choice -> device picker / standalone details ----
-        target_prompt = self._resolve_target(message, state, spec, form_values)
+        target_prompt = self._resolve_target(message, state, spec, form_values, device_rows)
         if target_prompt is not None:
             state.stage = ConfigStage.RESOLVE_TARGET
             conversation_store.set_config_state(session_id, state)

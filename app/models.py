@@ -105,7 +105,8 @@ class ConfigState(BaseModel):
     initial_extracted: bool = False
     form_cache: Optional[Dict[str, Any]] = None
     target_mode: Optional[str] = None                         # "integrated" | "standalone" (future)
-    target_device: Optional[Dict[str, Any]] = None
+    target_device: Optional[Dict[str, Any]] = None            # the single/primary device (back-compat)
+    target_devices: List[Dict[str, Any]] = Field(default_factory=list)  # 1..N devices (multi-device targeting)
     target_filling: bool = False                              # collecting connection fields missing from inventory
     delivery_mode: str = "manual"                             # "manual" (v1) | "automated" (future)
     approved: bool = False
